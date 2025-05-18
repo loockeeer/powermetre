@@ -1,3 +1,4 @@
+#include <math.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -7,7 +8,7 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 
-int spawn_child(char *program,char *argv[]){
+int spawn_child(char *program, char *argv[]){
 	pid_t child_pid = fork();
 
 	if(child_pid > 0){
@@ -56,7 +57,7 @@ long double spent_children_time() {
 }
 
 int main(int argc, char *argv[]) {
-	if(argc < 2)
+	if(argc < 3)
 	{
 		printf("pas assez d'args\n");
 		return 1;
@@ -64,15 +65,13 @@ int main(int argc, char *argv[]) {
 	int retval;
 	int event_set = PAPI_NULL;
 	long long start_time, end_time;
-	long long values[2]; // Array to store energy values
+	long long values[2];
 
-	// Initialize the PAPI library
 	if ((retval = PAPI_library_init(PAPI_VER_CURRENT)) != PAPI_VER_CURRENT) {
 		fprintf(stderr, "PAPI_library_init failed: %s\n", PAPI_strerror(retval));
 		return 1;
 	}
 
-	// Create a new event set
 	if ((retval = PAPI_create_eventset(&event_set)) != PAPI_OK) {
 		fprintf(stderr, "PAPI_create_eventset failed: %s\n", PAPI_strerror(retval));
 		return 1;
@@ -84,38 +83,60 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	if ((retval = PAPI_add_named_event(event_set, "rapl:::DRAM_ENERGY:PACKAGE0")) != PAPI_OK) {
-		fprintf(stderr, "PAPI_add_event (PAPI_ENERGY_DRAM) failed: %s\n", PAPI_strerror(retval));
-		return 1;
-	}
-
 	// Start counting events
-	if ((retval = PAPI_start(event_set)) != PAPI_OK) {
-		fprintf(stderr, "PAPI_start failed: %s\n", PAPI_strerror(retval));
-		return 1;
-	}
 
-	// Perform some workload or sleep
 	printf("Measuring energy consumption...\n");
-	start_time = PAPI_get_real_nsec();
-	spawn_child(argv[1], make_null_terminated_argv(argc-1, argv+1));
-	int status;
-	wait(&status);
-	end_time = PAPI_get_real_nsec();
-	// Stop counting and read values
-	if ((retval = PAPI_stop(event_set, values)) != PAPI_OK) {
-		fprintf(stderr, "PAPI_stop failed: %s\n", PAPI_strerror(retval));
-		return 1;
+	int N = atoi(argv[1]);
+	long double *measurements = calloc(N, sizeof(long double));
+	char **arg = make_null_terminated_argv(argc-2, argv+2);
+	for(int i = 0; i < N; i++) {
+		start_time = PAPI_get_real_nsec();
+		if ((retval = PAPI_start(event_set)) != PAPI_OK) {
+			fprintf(stderr, "PAPI_start failed: %s\n", PAPI_strerror(retval));
+			free(arg);
+			free(measurements);
+			return 1;
+		}
+		spawn_child(argv[2], arg);
+		int status;
+		wait(&status);
+		end_time = PAPI_get_real_nsec();
+		// Stop counting and read values
+		if ((retval = PAPI_stop(event_set, values)) != PAPI_OK) {
+			fprintf(stderr, "PAPI_stop failed: %s\n", PAPI_strerror(retval));
+			free(arg);
+			free(measurements);
+			return 1;
+		}
+		if ((retval = PAPI_reset(event_set)) != PAPI_OK) {
+			fprintf(stderr, "PAPI_reset failed: %s\n", PAPI_strerror(retval));
+			free(arg);
+			free(measurements);
+			return 1;
+		}
+
+		long long diff = end_time - start_time;
+		long double real_child_time = spent_children_time();
+		long double prop = (real_child_time)/((long double)diff);
+		long double package_energy = ((long double)values[0])*prop;
+		measurements[i] = package_energy;
 	}
-	long long diff = end_time - start_time;
-	long double real_child_time = spent_children_time();
-	long double prop = (real_child_time)/((long double)diff);
-	// Print the measured energy values
-	printf("Energy consumption:\n");
-	printf("  Package power: %Lf J\n", ((long double)values[0])*prop);
-	printf("  DRAM power: %Lf J\n",((long double)values[1])*prop);
-	printf("  Time (real): %Lf (%Lf) s\n", diff/((long double)1e9), real_child_time);
-	printf("  Overshoot : %Lf s\n",diff/((long double)1e9) -real_child_time );
+	free(arg);
+
+	long double average_energy = 0.;
+	long double energy_std = 0.;
+	for(int i = 0; i < N; i++) {
+		average_energy += measurements[i];
+	}
+	average_energy = average_energy/N;
+	for(int i = 0; i < N; i++) {
+		energy_std += (measurements[i] - average_energy)*(measurements[i] - average_energy);
+	}
+	energy_std = sqrtl(energy_std/N);
+	printf("Successfully completed %d measurements", N);
+	printf("E = %lf J", average_energy);
+	printf("u(E) = %lf J", energy_std);
+	free(measurements);
 	// Cleanup
 	if ((retval = PAPI_cleanup_eventset(event_set)) != PAPI_OK) {
 		fprintf(stderr, "PAPI_cleanup_eventset failed: %s\n", PAPI_strerror(retval));
